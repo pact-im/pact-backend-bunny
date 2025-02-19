@@ -3,12 +3,12 @@
 
 require "set"
 
-require "bunny/concurrent/atomic_fixnum"
 require "bunny/consumer_work_pool"
 
 require "bunny/exchange"
 require "bunny/queue"
 
+require "bunny/delivery_tag"
 require "bunny/delivery_info"
 require "bunny/return_info"
 require "bunny/message_properties"
@@ -690,51 +690,6 @@ module Bunny
 
     # @endgroup
 
-
-
-    # @group Message acknowledgements
-
-    # Rejects a message. A rejected message can be requeued or
-    # dropped by RabbitMQ.
-    #
-    # @param [Integer] delivery_tag Delivery tag to reject
-    # @param [Boolean] requeue      Should this message be requeued instead of dropping it?
-    # @see Bunny::Channel#ack
-    # @see Bunny::Channel#nack
-    # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
-    # @api public
-    def reject(delivery_tag, requeue = false)
-      basic_reject(delivery_tag.to_i, requeue)
-    end
-
-    # Acknowledges a message. Acknowledged messages are completely removed from the queue.
-    #
-    # @param [Integer] delivery_tag Delivery tag to acknowledge
-    # @param [Boolean] multiple (false) Should all unacknowledged messages up to this be acknowledged as well?
-    # @see Bunny::Channel#nack
-    # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
-    # @api public
-    def ack(delivery_tag, multiple = false)
-      basic_ack(delivery_tag.to_i, multiple)
-    end
-    alias acknowledge ack
-
-    # Rejects a message. A rejected message can be requeued or
-    # dropped by RabbitMQ. This method is similar to {Bunny::Channel#reject} but
-    # supports rejecting multiple messages at once, and is usually preferred.
-    #
-    # @param [Integer] delivery_tag Delivery tag to reject
-    # @param [Boolean] multiple (false) Should all unacknowledged messages up to this be rejected as well?
-    # @param [Boolean] requeue  (false) Should this message be requeued instead of dropping it?
-    # @see Bunny::Channel#ack
-    # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
-    # @api public
-    def nack(delivery_tag, multiple = false, requeue = false)
-      basic_nack(delivery_tag.to_i, multiple, requeue)
-    end
-
-    # @endgroup
-
     #
     # Lower-level API, exposes protocol operations as they are defined in the protocol,
     # without any OO sugar on top, by design.
@@ -1042,10 +997,13 @@ module Bunny
     # @api public
     def basic_reject(delivery_tag, requeue = false)
       raise_if_no_longer_open!
-      @connection.send_frame(AMQ::Protocol::Basic::Reject.encode(@id, delivery_tag, requeue))
+      transport = delivery_tag.is_a?(DeliveryTag) ? delivery_tag.transport : @connection.transport
+      transport.send_frame_without_recovery(AMQ::Protocol::Basic::Reject.encode(@id, delivery_tag.to_i, requeue))
+      @connection.signal_activity!
 
       nil
     end
+    alias reject basic_reject
 
     # Acknowledges a delivery (message).
     #
@@ -1060,7 +1018,7 @@ module Bunny
     #   ch    = conn.create_channel
     #   q.subscribe do |delivery_info, properties, payload|
     #     # requeue the message
-    #     ch.basic_ack(delivery_info.delivery_tag.to_i)
+    #     ch.basic_ack(delivery_info.delivery_tag)
     #   end
     #
     # @example Ack a message fetched via basic.get
@@ -1070,7 +1028,7 @@ module Bunny
     #   ch    = conn.create_channel
     #   # we assume the queue exists and has messages
     #   delivery_info, properties, payload = ch.basic_get("bunny.examples.queue3", manual_ack: true)
-    #   ch.basic_ack(delivery_info.delivery_tag.to_i)
+    #   ch.basic_ack(delivery_info.delivery_tag)
     #
     # @example Ack multiple messages fetched via basic.get
     #   conn  = Bunny.new
@@ -1082,18 +1040,20 @@ module Bunny
     #   _, _, payload2 = ch.basic_get("bunny.examples.queue3", manual_ack: true)
     #   delivery_info, properties, payload3 = ch.basic_get("bunny.examples.queue3", manual_ack: true)
     #   # ack all fetched messages up to payload3
-    #   ch.basic_ack(delivery_info.delivery_tag.to_i, true)
+    #   ch.basic_ack(delivery_info.delivery_tag, true)
     #
     # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
     # @api public
     def basic_ack(delivery_tag, multiple = false)
-      guarding_against_stale_delivery_tags(delivery_tag) do
-        raise_if_no_longer_open!
-        @connection.send_frame(AMQ::Protocol::Basic::Ack.encode(@id, delivery_tag, multiple))
+      raise_if_no_longer_open!
+      transport = delivery_tag.is_a?(DeliveryTag) ? delivery_tag.transport : @connection.transport
+      transport.send_frame_without_recovery(AMQ::Protocol::Basic::Ack.encode(@id, delivery_tag.to_i, multiple))
+      @connection.signal_activity!
 
-        nil
-      end
+      nil
     end
+    alias acknowledge basic_ack
+    alias ack basic_ack
 
     # Rejects or requeues messages just like {Bunny::Channel#basic_reject} but can do so
     # with multiple messages at once.
@@ -1149,16 +1109,14 @@ module Bunny
     # @see http://rubybunny.info/articles/extensions.html RabbitMQ Extensions guide
     # @api public
     def basic_nack(delivery_tag, multiple = false, requeue = false)
-      guarding_against_stale_delivery_tags(delivery_tag) do
-        raise_if_no_longer_open!
-        @connection.send_frame(AMQ::Protocol::Basic::Nack.encode(@id,
-                                                                 delivery_tag,
-                                                                 multiple,
-                                                                 requeue))
+      raise_if_no_longer_open!
+      transport = delivery_tag.is_a?(DeliveryTag) ? delivery_tag.transport : @connection.transport
+      transport.send_frame_without_recovery(AMQ::Protocol::Basic::Nack.encode(@id, delivery_tag.to_i, multiple, requeue))
+      @connection.signal_activity!
 
-        nil
-      end
+      nil
     end
+    alias nack basic_nack
 
     # Registers a consumer for queue. Delivered messages will be handled with the block
     # provided to this method.
@@ -2244,7 +2202,7 @@ module Bunny
 
     # @private
     def handle_basic_get_ok(basic_get_ok, properties, content)
-      basic_get_ok.delivery_tag = basic_get_ok.delivery_tag
+      basic_get_ok.delivery_tag = DeliveryTag.new(basic_get_ok.delivery_tag, @connection.transport)
       @basic_get_continuations.push([basic_get_ok, properties, content])
     end
 
@@ -2265,8 +2223,11 @@ module Bunny
       end
 
       if consumer
+        # Ensure that we pin delivery info to the underlying connection before
+        # submitting to the work pool for guarding against stale delivery tags.
+        delivery_info = DeliveryInfo.new(basic_deliver, consumer, self)
         @work_pool.submit do
-          deliver_to_consumer(consumer, basic_deliver, properties, content)
+          deliver_to_consumer(consumer, delivery_info, properties, content)
         end
       else
         @logger.warn "No consumer for tag #{basic_deliver.consumer_tag} on channel #{@id}!"
@@ -2274,9 +2235,9 @@ module Bunny
     end
 
     # @private
-    def deliver_to_consumer(consumer, basic_deliver, properties, content)
+    def deliver_to_consumer(consumer, delivery_info, properties, content)
       begin
-        consumer.call(DeliveryInfo.new(basic_deliver, consumer, self), MessageProperties.new(properties), content)
+        consumer.call(delivery_info, MessageProperties.new(properties), content)
       rescue StandardError => e
         @uncaught_exception_handler.call(e, consumer) if @uncaught_exception_handler
       end
@@ -2722,13 +2683,6 @@ module Bunny
     # @private
     def new_continuation
       Concurrent::ContinuationQueue.new
-    end
-
-    # @private
-    def guarding_against_stale_delivery_tags(tag, &block)
-      case tag
-      when Integer then block.call
-      end
     end
   end # Channel
 end # Bunny
